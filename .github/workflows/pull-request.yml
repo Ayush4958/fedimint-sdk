@@ -35,6 +35,7 @@ jobs:
               - 'package.json'
               - 'pnpm-lock.yaml'
               - 'tsconfig.base.json'
+              - '.github/workflows/**'
             web:
               - 'packages/core/**'
               - 'packages/types/**'
@@ -48,6 +49,7 @@ jobs:
               - 'vitest.config.ts'
               - 'vitest.workspace.ts'
               - 'scripts/**'
+              - '.github/workflows/**'
             react-native:
               - 'packages/react-native/**'
               - 'packages/react-native-bindings/**'
@@ -60,12 +62,15 @@ jobs:
               - '.github/actions/setup-nix/**'
               - '.github/actions/build-rn-android/**'
               - '.github/actions/build-rn-ios/**'
+              - '.github/workflows/**'
             docs:
               - 'docs/**'
               - 'packages/core/**'
               - 'packages/types/**'
+              - '.github/workflows/**'
             cli:
               - 'packages/create-fedimint-app/**'
+              - '.github/workflows/**'
 
   # Reusable verify jobs (lint always runs; others are conditional)
 
