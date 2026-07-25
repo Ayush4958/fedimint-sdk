@@ -61,3 +61,5 @@ This will start a development server with hot module replacement. The template i
 - Fedimint wallet integration
 - Basic styling with CSS
 - Vite for fast development and building
+
+<!-- test skip ci cli -->
