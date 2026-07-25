@@ -45,3 +45,5 @@ features:
     title: Framework Agnostic
     details: Designed as a "core" library compatible with vanilla JavaScript, laying the groundwork for future framework-specific packages.
 ---
+
+<!-- test skip ci -->
