@@ -2,10 +2,6 @@ name: Pull Request
 on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
-    paths-ignore:
-      - 'packages/react-native/**'
-      - 'packages/react-native-bindings/**'
-      - 'fedimint-sdk-ffi'
   workflow_dispatch:
 
 concurrency:
@@ -13,6 +9,107 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+
+ # 1. Lightweight change-detection (runs in ~10 s)
+
+  detect-changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      core: ${{ steps.filter.outputs.core }}
+      web: ${{ steps.filter.outputs.web }}
+      react-native: ${{ steps.filter.outputs.react-native }}
+      docs: ${{ steps.filter.outputs.docs }}
+      cli: ${{ steps.filter.outputs.cli }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            core:
+              - 'packages/core/**'
+              - 'packages/types/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'tsconfig.base.json'
+            web:
+              - 'packages/core/**'
+              - 'packages/types/**'
+              - 'packages/core-web/**'
+              - 'packages/transport-web/**'
+              - 'packages/wasm-bundler/**'
+              - 'packages/wasm-web/**'
+              - 'packages/integration-tests/**'
+              - 'flake.nix'
+              - 'flake.lock'
+              - 'vitest.config.ts'
+              - 'vitest.workspace.ts'
+              - 'scripts/**'
+            react-native:
+              - 'packages/react-native/**'
+              - 'packages/react-native-bindings/**'
+              - 'packages/core/**'
+              - 'packages/types/**'
+              - 'fedimint-sdk-ffi/**'
+              - 'flake.nix'
+              - 'flake.lock'
+              - 'Justfile'
+              - '.github/actions/setup-nix/**'
+              - '.github/actions/build-rn-android/**'
+              - '.github/actions/build-rn-ios/**'
+            docs:
+              - 'docs/**'
+              - 'packages/core/**'
+              - 'packages/types/**'
+            cli:
+              - 'packages/create-fedimint-app/**'
+
+  # Reusable verify jobs (lint always runs; others are conditional)
+
   verify:
     name: Verify
+    needs: detect-changes
     uses: ./.github/workflows/verify.yml
+    secrets: inherit
+    with:
+      run_core: ${{ needs.detect-changes.outputs.core == 'true' || needs.detect-changes.outputs.web == 'true' }}
+      run_web: ${{ needs.detect-changes.outputs.web == 'true' }}
+      run_docs: ${{ needs.detect-changes.outputs.docs == 'true' }}
+      run_cli: ${{ needs.detect-changes.outputs.cli == 'true' }}
+
+  # 3. React Native builds (only when relevant paths change)
+
+  build-android:
+    name: Build Android
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.react-native == 'true' }}
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: ./.github/actions/build-rn-android
+
+  build-ios:
+    name: Build iOS
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.react-native == 'true' }}
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/setup-nix
+        with:
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: ./.github/actions/build-rn-ios
+        with:
+          device-only: 'true'
