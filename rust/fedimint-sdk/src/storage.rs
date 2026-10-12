@@ -3,6 +3,7 @@
 use fedimint_core::db::Database;
 use fedimint_core::db::mem_impl::MemDatabase;
 use fedimint_core::module::registry::ModuleDecoderRegistry;
+use fedimint_core::util::FmtCompact as _;
 #[cfg(not(target_family = "wasm"))]
 use fedimint_core::{apply, async_trait_maybe_send, db::IRawDatabase};
 
@@ -111,7 +112,32 @@ use crate::{Error, ErrorCode, ErrorDetails, Result};
 ///
 /// The persisted seed is not encrypted at rest; it is stored the way the backend stores
 /// everything else. Protecting a copy the application has already exported is the
-/// application's own responsibility, see [`Mnemonic`](crate::Mnemonic).
+/// application's own responsibility, see [`Mnemonic`](crate::Mnemonic). So is the
+/// directory-level protection the platform offers, which the SDK does not set itself; on Apple
+/// platforms see below.
+///
+/// # On Apple platforms
+///
+/// Pass [`Storage::at`] a directory under Application Support rather than Documents: the store
+/// is the application's own state, and anything in Documents can surface in the Files app.
+/// Before the first open, the application should also set two properties on that directory.
+/// The SDK sets neither itself.
+///
+/// - **Data Protection class `NSFileProtectionCompleteUntilFirstUserAuthentication`.** It is
+///   deliberately *not* `NSFileProtectionComplete`, the obvious-looking stricter choice.
+///   `Complete` makes the files unreadable whenever the device is locked. An instance that
+///   keeps working in the background, or is woken for a notification, then fails its next read
+///   with [`ErrorCode::Storage`](crate::ErrorCode::Storage), partway through whatever it was
+///   doing. Until-first-unlock keeps the store encrypted from boot until the user first unlocks
+///   the device, which covers a device taken while powered off. Files the store creates later
+///   inherit the class from the directory.
+/// - **`isExcludedFromBackup`.** Without it, the store, and with it the unencrypted seed, goes
+///   into iCloud and into computer backups, which may not be encrypted. The seed phrase the
+///   user writes down is the backup. A restored device rejoins its federations through
+///   [`Sdk::recover`](crate::Sdk::recover) rather than from a copied store, which the
+///   single-opener rule above cannot tell apart from a second device anyway.
+///
+/// The iOS demo's `DemoModel.dataDirectory()` does both.
 #[derive(Debug)]
 pub struct Storage {
     inner: StorageInner,
@@ -387,7 +413,10 @@ async fn open_directory(location: String) -> Result<Database> {
             .map_err(|err| {
                 Error::new(
                     ErrorCode::Storage,
-                    format!("could not open the storage at {location}: {err}"),
+                    format!(
+                        "could not open the storage at {location}: {}",
+                        err.fmt_compact()
+                    ),
                 )
             })?;
         Ok(ClaimedStore { store, claim })
@@ -573,7 +602,10 @@ async fn open_browser(location: String) -> Result<Database> {
     let raw = fedimint_cursed_redb::MemAndRedb::new(handle).map_err(|err| {
         Error::new(
             ErrorCode::Storage,
-            format!("could not open the storage named {location}: {err}"),
+            format!(
+                "could not open the storage named {location}: {}",
+                err.fmt_compact()
+            ),
         )
     })?;
     Ok(Database::new(raw, ModuleDecoderRegistry::default()))

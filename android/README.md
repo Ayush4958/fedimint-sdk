@@ -11,16 +11,19 @@ is a view of that API rather than a copy of it that could drift.
 
 ## Scope
 
-Three `Sdk` methods, plus the constructor and the two value types they need:
+The table lists what it takes to open the SDK and join a federation: the
+`createFedimintSdk` function, three `Sdk` methods and the two handle types they
+use. `Sdk` has more methods, which list, reopen, close and forget federations,
+report their status, run recovery and shut the SDK down.
 
-| Kotlin                                                              | What it does                                  |
-| ------------------------------------------------------------------- | --------------------------------------------- |
-| `createFedimintSdk(dataDir, seed?)`                                 | Opens storage; `build()` establishes the seed |
-| `sdk.exportMnemonic()`                                              | The instance's `Mnemonic` handle, to back up  |
-| `sdk.preview(invite)`                                               | Reads a federation's config without joining   |
-| `sdk.join(invite)`                                                  | Joins it, returns a `Federation` handle       |
-| `Mnemonic.generate()` / `.fromWords(List)` / `mnemonic.words()`     | make / restore / read a seed                  |
-| `InviteCode.parse(String)` / `invite.federationId()` / `.display()` | parse / inspect / render a code               |
+| Kotlin                                                              | What it does                                 |
+| ------------------------------------------------------------------- | -------------------------------------------- |
+| `createFedimintSdk(dataDir, mnemonic?)`                             | Opens storage; establishes the seed          |
+| `sdk.exportMnemonic()`                                              | The instance's `Mnemonic` handle, to back up |
+| `sdk.preview(invite)`                                               | Reads a federation's config without joining  |
+| `sdk.join(invite)`                                                  | Joins it, returns a `Federation` handle      |
+| `Mnemonic.generate()` / `.fromWords(List)` / `mnemonic.words()`     | make / restore / read a seed                 |
+| `InviteCode.parse(String)` / `invite.federationId()` / `.display()` | parse / inspect / render a code              |
 
 `Mnemonic` and `InviteCode` are **opaque handles**, not strings — an invite code
 is a bearer credential and a seed is a secret that the Rust type keeps behind a
@@ -33,12 +36,16 @@ The seed is established by `createFedimintSdk`: pass a `Mnemonic` to restore, or
 `null` to load the seed the directory already holds — or, over an empty
 directory, generate and persist a fresh one. `sdk.exportMnemonic()` reads it back.
 
-The `Federation` that `join` returns carries the rest of the surface: `balance()`,
+The `Federation` that `join` returns has the per-federation calls: `balance()`,
 `capabilities()`, `activity()`, `meta()`, `operation(id)`, and the `ecash()`,
 `lightning()` and `onchain()` facades (each `null` when the federation lacks that
 module), whose `quote` → `send` and `receive` calls return operation handles to
-observe with `state()`, `updates()` and `awaitFinal()`. The example app
-(`android/app`) drives each of them once.
+observe with `state()`, `updates()` and `awaitFinal()`. An on-chain deposit is the
+exception: `onchain.receive()` returns an address to pay and no operation, because
+a deposit becomes an operation only once the federation's wallet finds the
+payment. Open `onchain.deposits()` before showing the address, so that a payment
+found right away is not missed, and call `next()` on it to wait for the next
+deposit's operation. The example app (`android/app`) drives each of them once.
 
 ## Using it
 
@@ -122,9 +129,22 @@ your app's manifest; both are normal permissions, so there is no runtime prompt:
 
 Don't strip `ACCESS_NETWORK_STATE` (for example with `tools:node="remove"`).
 Android has no readable `resolv.conf`, so the SDK asks `ConnectivityManager` for
-the DNS servers. Without the permission that call fails, and iroh falls back to
-Google's public DNS servers with only a logcat warning, which breaks on networks
-that block outside DNS.
+the DNS servers. Without the permission that call fails, and iroh resolves
+through the public DNS servers of Cloudflare, Google and Quad9 instead, with
+only a logcat warning.
+
+Lookups can reach those three with the permission too. When every one of the
+device's own DNS servers answers a lookup with a server error such as
+`SERVFAIL` or `REFUSED`, or no query can be sent to them, iroh asks the public
+servers for it, over plain DNS and DNS over HTTPS. A server that never replies
+does not count, since iroh gives up on the lookup first, and a reply that the
+name does not exist or has no such record is final. This fallback is iroh's
+default. The SDK keeps it and has no setting to turn it off.
+
+The SDK carries two versions of iroh, and the above describes the newer one.
+The older one, which makes the iroh connections to Lightning gateways, reads
+only `resolv.conf`. On Android its resolver therefore always asks Google's
+public DNS servers, with or without the permission, and logs no warning.
 
 There is no initialization call. The SDK finds your `Application` itself when
 `createFedimintSdk` runs, so it is fine to touch other bindings, such as
@@ -200,10 +220,6 @@ android/
         ├── jniLibs/<abi>/*.so       generated, gitignored
         └── java/org/fedimint/sdk/   generated, gitignored
 ```
-
-## What's not here yet
-
-iOS bindings are a separate follow-up off the same `uniffi` feature.
 
 ## Publishing
 

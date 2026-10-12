@@ -74,9 +74,14 @@ generate and persist a fresh one. `sdk.exportMnemonic()` reads it back.
 The `Federation` that `join` returns carries the rest: `balance()`,
 `balanceUpdates()`, `capabilities()`, `meta()`, `activity(cursor:limit:)`,
 `operation(id:)`, and the `ecash()`, `lightning()` and `onchain()` facades (each
-`nil` when the federation lacks that module), whose `quote` → `send` and
-`receive` calls return operation handles to observe with `state()`, `updates()`
-and `awaitFinal()`. The demo app (`ios/Demo`) drives each of them once.
+`nil` when the federation lacks that module). Their `quote` → `send` calls and
+the `receive` calls of `ecash()` and `lightning()` return operation handles to
+observe with `state()`, `updates()` and `awaitFinal()`. On-chain `receive()` is
+the exception: it returns an address to pay and no operation, because a deposit
+becomes an operation only once the federation's wallet finds the payment, and
+`onchain().deposits()` is where those operations arrive (see
+[Receiving on-chain](#receiving-on-chain)). The demo app (`ios/Demo`) drives
+each of them once.
 
 ## Using it
 
@@ -86,10 +91,18 @@ import FedimintSdk
 // 1. Open the SDK over an app-private directory. `nil` loads the seed already
 //    there, or generates one when the directory is empty; pass a Mnemonic
 //    (Mnemonic.fromWords(words:)) to restore.
-let dataDir = FileManager.default
+//    Protect it before the first open; see "Protecting the wallet directory".
+var dataDir = FileManager.default
     .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
     .appendingPathComponent("fedimint")
-try FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
+let protection: [FileAttributeKey: Any] =
+    [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]
+try FileManager.default.createDirectory(
+    at: dataDir, withIntermediateDirectories: true, attributes: protection)
+try FileManager.default.setAttributes(protection, ofItemAtPath: dataDir.path)
+var values = URLResourceValues()
+values.isExcludedFromBackup = true
+try dataDir.setResourceValues(values)
 
 let sdk = try await createFedimintSdk(dataDir: dataDir.path, mnemonic: nil)
 
@@ -111,6 +124,93 @@ let balanceMsats: UInt64 = try await federation.balance()
 Every call that touches disk or the network is `async throws`, so it needs an
 `await` and a `Task` — there is no synchronous variant and no completion-handler
 variant.
+
+### Receiving on-chain
+
+`onchain.receive()` returns an address to pay, and nothing else exists for it
+yet: no operation, no operation id and no state. A deposit becomes an operation
+when the federation's wallet finds the payment, which is once its transaction
+has the confirmations the federation requires. `onchain.deposits()` opens a
+subscription to those operations. Open it _before_ the address is shown: it only
+yields the deposits found after it was opened, so one opened later can miss a
+payment that is found right away.
+
+```swift
+guard let onchain = federation.onchain() else { return }
+
+let deposits = try await onchain.deposits()
+let address = try await onchain.receive()
+show("Send bitcoin to \(address)")
+
+// Resolves with the next deposit found, to whichever of the wallet's addresses
+// it was paid. The deposit's details name that address.
+let operation = try await deposits.next()
+let details = try await operation.details()
+show("Deposit found at \(details.address)")
+
+let updates = operation.updates()
+while let state = try await updates.next() {
+    switch state {
+    case .confirmed(let txid, let sats): show("\(sats) sat found in \(txid)")
+    case .claimed(_, _, let msats):      show("credited \(msats / 1_000) sat")
+    case .failed(let reason):            show("failed: \(reason)")
+    }
+}
+```
+
+The first state an application sees is `.confirmed`, a deposit that was found
+and is being claimed, or `.claimed` if it looks later. `.claimed` and `.failed`
+are final. There is no state for an unpaid address, and none for a transaction
+that is still short of its confirmations.
+
+`next()` never ends cleanly: it resolves with a deposit, or throws an `SdkError`
+whose `code()` is `.federationClosed` once the federation is closed or the SDK
+shut down. Cancelling the `Task` that awaits it does not cancel the call; see
+[Cancelling a `Task`](#cancelling-a-task-does-not-cancel-an-sdk-call).
+
+- `activity(cursor:limit:)` lists every deposit found, including ones found while
+  no subscription was open, and `operation(id:)` finds a deposit by id across
+  restarts. An address nobody has paid has no activity row.
+- `receive()` promises only an address to pay. Depending on the federation,
+  repeated calls return the same address until a payment to it has been found,
+  or a new address every time. An application must not rely on either.
+- One address is for one payment: ask for a new one after a deposit rather than
+  reusing a paid one. A second payment to an address that was already paid may
+  go undetected for a long time on some federations.
+
+### Protecting the wallet directory
+
+The SDK stores the seed phrase unencrypted inside its directory, and it does not
+protect that directory itself. That is the app's job, and the snippet above
+does both parts:
+
+- **Data Protection class `completeUntilFirstUserAuthentication`**, and _not_
+  `complete`. `complete` locks the files whenever the device is locked, so an
+  SDK still working in the background, or woken for a notification, fails its
+  next read with `.storage`. Until-first-unlock keeps the store encrypted from
+  boot until the first unlock. `createDirectory`'s `attributes` only apply when
+  it creates the directory, hence the separate `setAttributes` for an existing
+  one.
+- **`isExcludedFromBackup`**, or the store goes into iCloud and into computer
+  backups, which may not be encrypted. The written-down seed phrase is the
+  backup. A restored device recovers from it rather than from a copied store.
+
+Keep the directory in Application Support, not Documents, so it never shows up
+in the Files app. `DemoModel.dataDirectory()` in [`Demo/`](Demo) is the worked
+example, and `Storage` in the Rust crate documents the reasoning.
+
+### App Store export compliance
+
+App Store Connect asks every upload whether the app uses non-exempt
+encryption, and holds a TestFlight build until it is answered.
+`ITSAppUsesNonExemptEncryption` in `Info.plist` answers it up front. The demo
+declares `false`.
+
+What the SDK brings into an app is standard encryption, not a proprietary
+scheme: TLS and QUIC to guardians and gateways, BLS threshold signatures for
+e-cash, and Bitcoin's secp256k1 signatures and hashes. Whether that is exempt for your app, and whether your app adds anything
+of its own, is a determination each wallet has to make for itself under Apple's
+export compliance guidance. The demo's `false` is not that determination.
 
 ### Error handling
 
@@ -213,6 +313,11 @@ the shell for `swift test`. The filter in force is logged once at startup as
 `logging to os_log filter=…`. Lines below `info` are logged as private, so
 they show as `<private>` unless the device has a logging profile that reveals
 them.
+
+The filter is read from the environment once, at launch, and nothing on the
+device can change it afterwards. This is deliberate. On Android,
+`debug.fedimint_sdk.log` can be raised by anyone with `adb` access to the
+device. Here, raising verbosity takes a build or a launch you control.
 
 A Rust panic is logged there too, with its thread, file and line, as a fault.
 **It still terminates the app**: the release build aborts on panic, by design.

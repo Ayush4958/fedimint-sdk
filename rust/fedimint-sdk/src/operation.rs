@@ -1,10 +1,11 @@
 //! The operation model: background work observed from the outside.
 //!
 //! Everything the SDK does that takes longer than a single call, paying an
-//! invoice, waiting for a deposit to confirm, redeeming ecash, is an
-//! *operation*. An operation is created by a facade call, runs in the
-//! background from that moment, is persisted as it goes, and reports its
-//! progress as a sequence of states. This module defines the vocabulary
+//! invoice, claiming a deposit, redeeming ecash, is an *operation*. An
+//! operation is created by a facade call, or for an on-chain deposit by the
+//! wallet finding the payment, runs in the background from that moment, is
+//! persisted as it goes, and reports its progress as a sequence of states.
+//! This module defines the vocabulary
 //! shared by all of them: the [`OperationState`] trait each state enum
 //! implements, the [`Operation`] handle used to observe one, the
 //! [`OperationUpdates`] subscriber that streams its transitions, the
@@ -78,8 +79,8 @@ pub trait OperationState: sealed::Sealed + Clone + Send + Sync + 'static {
 ///
 /// An [`OperationId`] is all it takes to pick an operation back up, and this
 /// record is half of what makes that true: the notes a sender must hand to a
-/// receiver, the invoice a payee must show as a QR code, the deposit address
-/// a depositor must display, and the terms an operation was executed on (a
+/// receiver, the invoice a payee must show as a QR code, the address and
+/// transaction of a deposit, and the terms an operation was executed on (a
 /// lightning fee and route, for instance) all live here rather than only in
 /// the value the original facade call returned, because
 /// [`Operation::updates`] is not a replay and would not hand them back.
@@ -98,13 +99,12 @@ pub trait OperationState: sealed::Sealed + Clone + Send + Sync + 'static {
 ///    successful lightning payment is the example: it exists exactly when
 ///    [`LnSendState::Success`](crate::LnSendState::Success) does.
 /// 3. **Set by a transition but not carried by every later state: both.**
-///    The state announces it; the record keeps it. The funding transaction a
-///    caller learns from
-///    [`WaitingForConfirmation`](crate::OnchainReceiveState::WaitingForConfirmation)
-///    is gone by [`Claimed`](crate::OnchainReceiveState::Claimed), and a
-///    lightning send's fee and route appear only on success; these are
-///    exactly the values an `Option` field on a record is for, absent until
-///    the fact is established, then set once and never changed again.
+///    The state announces it; the record keeps it. What claiming an
+///    on-chain deposit cost is known only at
+///    [`Claimed`](crate::OnchainReceiveState::Claimed), and a lightning
+///    send's fee and route appear only on success; these are exactly the
+///    values an `Option` field on a record is for, absent until the fact is
+///    established, then set once and never changed again.
 ///
 /// A caller never needs to have seen an earlier state: whatever it takes to
 /// render or complete a reattached operation, [`Operation::details`] and the
@@ -128,7 +128,7 @@ pub trait OperationState: sealed::Sealed + Clone + Send + Sync + 'static {
 // Fedimint does not let an embedder join the transaction the module commits its own operation
 // log entry in: no module's creation method takes a `dbtx`, and the `_dbtx` variants that would
 // allow it hang off `ClientContext`, which only a module implementation holds
-// (fedimint-client-module/src/module/mod.rs:400, :662, :865). So the record is written
+// (fedimint-client-module/src/module/mod.rs:407, :682, :882). So the record is written
 // immediately after the module call returns and before the creating call hands back a handle,
 // which is what the crate's durability contract actually promises (see the durability section on
 // `Sdk`), and a crash in the window between the two commits is repaired by
@@ -154,13 +154,15 @@ pub trait DetailedOperationState: OperationState {
 
 /// A handle for observing one background operation.
 ///
-/// An operation starts running the moment the facade call that created it
-/// returns, and it keeps running whether or not anyone is watching. This
-/// handle observes; it does not own. Dropping it, or an [`OperationUpdates`]
-/// obtained from it, does not cancel, pause, or abort anything: the only
-/// thing that ends an operation is reaching a final state. This holds across
-/// restarts too: an operation is persisted as it progresses, resumes when the
-/// SDK is built again over the same storage, and can be picked up again with
+/// An operation starts running the moment it is created, which is when the
+/// facade call that creates it returns or, for an on-chain deposit, when the
+/// wallet finds the payment. It keeps running whether or not anyone is
+/// watching. This handle observes; it does not own. Dropping it, or an
+/// [`OperationUpdates`] obtained from it, does not cancel, pause, or abort
+/// anything: the only thing that ends an operation is reaching a final state.
+/// This holds across restarts too: an operation is persisted as it
+/// progresses, resumes when the SDK is built again over the same storage, and
+/// can be picked up again with
 /// [`Federation::operation`](crate::Federation::operation). Most operations
 /// have nothing to cancel, because the money has already moved into a
 /// protocol that will resolve one way or the other; where a cancellation
@@ -1281,7 +1283,7 @@ pub(crate) fn kind_of_tag(tag: &str) -> OperationKind {
 //
 // `MaybeSend`/`MaybeSync` and `BoxFuture`/`BoxStream` rather than `Send`/`Sync` and
 // `Box<dyn Future + Send>`: on `target_family = "wasm"` these expand to no bound at all
-// (`fedimint-core/src/task.rs:504-536`, `fedimint-core/src/util/mod.rs:31-35`),
+// (`fedimint-core/src/task.rs:504-536`, `fedimint-core/src/util/mod.rs:29-33`),
 // which is what lets one set of types compile for both a threaded host and a browser.
 //
 // Every method takes the federation rather than a `&Client`, so that a driver decides for itself
@@ -1311,8 +1313,8 @@ where
     // bounded read, and the stream it returns must register with the upstream notifier when it
     // is first polled, not before. That is the shape of upstream's `subscribe_*` methods, which
     // await only the operation-log read and hand back a lazily built stream through
-    // `ClientContext::outcome_or_updates` (fedimint-client-module/src/module/mod.rs:741; mint's
-    // `subscribe_spend_notes` at modules/fedimint-mint-client/src/lib.rs:2567 is typical). The
+    // `ClientContext::outcome_or_updates` (fedimint-client-module/src/module/mod.rs:758; mint's
+    // `subscribe_spend_notes` at modules/fedimint-mint-client/src/lib.rs:2705 is typical). The
     // engine keeps the returned stream across a dropped `next`, not the call that produced it,
     // and a driver that registered upstream and then parked in here, holding the client guard,
     // would in an idle subscriber hold the federation's close off for ever: `quiesce` takes the
@@ -2050,7 +2052,7 @@ impl OperationInner {
         let db = self.federation.db();
         let id = self.id;
         // Hoisted out of the closure, which may run more than once
-        // (`fedimint-core/src/db/mod.rs:534-536`).
+        // (`fedimint-core/src/db/mod.rs:542-544`).
         let requested_at = crate::db::now_millis();
         db.autocommit(
             |dbtx, _| {

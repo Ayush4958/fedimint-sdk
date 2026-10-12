@@ -9,14 +9,14 @@
       # input, fedimint-wasm below, and rust/fedimint-sdk/Cargo.toml together —
       # the pins-agree job in .github/workflows/rust-sdk-ci.yaml fails the build
       # when they drift.
-      url = "github:fedimint/fedimint?rev=1ab15e4b89aaa35727ca16e401d0cbc7d066de58";
+      url = "github:fedimint/fedimint?rev=1d3758c3fe3758207671a2d8af1fb564682e2392";
     };
     fedimint-wasm = {
       # The wasm client is built from this revision; keep it in sync with the
       # devimint input above and with rust/fedimint-sdk/Cargo.toml, so that
       # every client in this repo and the federation they are tested against
       # come from the same commit.
-      url = "github:fedimint/fedimint?rev=1ab15e4b89aaa35727ca16e401d0cbc7d066de58";
+      url = "github:fedimint/fedimint?rev=1d3758c3fe3758207671a2d8af1fb564682e2392";
     };
     nixpkgs-playwright = {
       # Playwright browsers have to match the `playwright` version pnpm-lock.yaml
@@ -605,6 +605,13 @@
             # See nix/web-bindgen.nix.
             ubrn = webBindgen.ubrn;
             wasm-bindgen-cli = webBindgen.wasm-bindgen-cli;
+            # Removes the LLVM bitcode rustc embeds in every object of an Apple static library;
+            # scripts/assemble-rn-ios-xcframework.sh runs it. Only this one tool is exposed: all
+            # of LLVM on PATH would put its dsymutil ahead of Xcode's.
+            llvm-bitcode-strip = pkgs.runCommand "llvm-bitcode-strip" { } ''
+              mkdir -p $out/bin
+              ln -s ${pkgs.llvm}/bin/llvm-bitcode-strip $out/bin/llvm-bitcode-strip
+            '';
           };
       }
     );

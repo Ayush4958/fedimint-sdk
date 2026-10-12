@@ -52,7 +52,29 @@ MSG
   exit 1
 fi
 
-echo "=== Android E2E (SDK) tests ==="
+# Which module generation the federation runs. scripts/setup_test_shell.sh
+# exports it (v1 unless the caller asked otherwise) when it sets the module
+# flags, so an unset value means the federation was not started by it.
+# `mixed` is refused rather than run: the SDK rejects a federation that mixes
+# module generations by design, so there is no successful payment to test.
+case "${FM_SDK_SHAPE:-}" in
+  v1 | v2) ;;
+  mixed)
+    echo "FM_SDK_SHAPE=mixed is not an Android E2E target: the SDK refuses federations" \
+      "that mix module generations. Use v1 or v2." >&2
+    exit 1
+    ;;
+  *)
+    echo "FM_SDK_SHAPE is '${FM_SDK_SHAPE:-}' — expected v1 or v2. Start the run through" \
+      "scripts/setup_test_shell.sh, which sets it." >&2
+    exit 1
+    ;;
+esac
+
+echo "=== Android E2E (SDK) tests — federation shape ${FM_SDK_SHAPE} ==="
+echo "module flags: mint=${FM_ENABLE_MODULE_MINT:-?} wallet=${FM_ENABLE_MODULE_WALLET:-?}" \
+  "ln=${FM_ENABLE_MODULE_LNV1:-?} mintv2=${FM_ENABLE_MODULE_MINTV2:-?}" \
+  "walletv2=${FM_ENABLE_MODULE_WALLETV2:-?} lnv2=${FM_ENABLE_MODULE_LNV2:-?}"
 
 cd "$REPO_ROOT"
 
@@ -108,9 +130,9 @@ fi
 LOG_DIR="${APPIUM_HOME:-$PKG_DIR/.appium}"
 mkdir -p "$LOG_DIR"
 
-# Appium is started with nohup, so it outlives this script unless stopped. In
-# CI the runner goes away with the job anyway; on a developer machine it would
-# otherwise keep a shell-enabled server running after the tests are done.
+# Appium is started with nohup, so it outlives this script unless stopped, and
+# neither a developer machine nor CI's self-hosted runner goes away with the
+# run: it would keep a shell-enabled server running after the tests are done.
 # Stops whichever server the PID file names, including one a previous run
 # left behind and this run reused, so the next run starts with current flags.
 stop_appium() {
@@ -268,7 +290,8 @@ else
   done
 
   if [[ -z "${TESTS_TO_RUN:-}" ]]; then
-    echo "Which tests to run? (mnemonic, inviteCode, federation, lightning, mint, all)"
+    echo "Which tests to run? (mnemonic, inviteCode, federation, lightning, mint," \
+      "lightningSend, errors, persistence, operationRestart, onchain, all)"
     read -r TESTS_TO_RUN
     TESTS_TO_RUN=${TESTS_TO_RUN:-all}
   fi
@@ -299,20 +322,63 @@ fi
 #              from the gateway's own API, not through the federation.
 #   faucet     FM_PORT_FAUCET, so a test could reach it from the device too;
 #              the runner itself talks to it from the host.
+#   esplora    FM_PORT_ESPLORA — the wallet client watches deposit addresses
+#              and broadcasts through the esplora URL in the federation's
+#              config, which names it on 127.0.0.1 like everything else.
 reverse_devimint_ports() {
   local base="$FM_FEDERATION_BASE_PORT"
   local fed_size="${FM_FED_SIZE:-4}"
   local ports_per_peer=4
   local last=$((base + fed_size * ports_per_peer - 1))
 
-  echo "Forwarding devimint ports into the emulator: $base-$last plus gateways/faucet"
+  echo "Forwarding devimint ports into the emulator: $base-$last plus gateways/faucet/esplora"
   local port
   for port in $(seq "$base" "$last") \
-    "${FM_PORT_GW_LND:-}" "${FM_PORT_GW_LDK:-}" "${FM_PORT_FAUCET:-}"; do
+    "${FM_PORT_GW_LND:-}" "${FM_PORT_GW_LDK:-}" "${FM_PORT_FAUCET:-}" \
+    "${FM_PORT_ESPLORA:-}"; do
     [[ -n "$port" ]] || continue
     adb -s "$DEVICE_ID" reverse "tcp:$port" "tcp:$port" >/dev/null
   done
 }
+
+# ── lnv2: one gateway, the funded one ──────────────────────────────────
+#
+# The lnv2 client picks a gateway at random from the guardians' list on
+# purpose, and devimint's wasm-test-setup funds only the LND gateway's ecash,
+# so a receive through either LDK gateway cannot be funded and a send through
+# the faucet's own LDK gateway to the faucet's invoice is a self-payment.
+# Removing the LDK entries through the same admin call devimint used to add
+# them leaves the funded gateway as the SDK's only choice, and the faucet's LDK
+# node as the counterparty — as on v1, where the SDK picks the cheapest gateway
+# and wasm-test-setup sets the LND gateway's fees to zero. The same step as
+# rust/fedimint-sdk/tests/integration.rs's pin_lnv2_gateway_to_lnd and
+# scripts/run-sdk-examples-inner.sh, except once per guardian: this federation
+# has FM_FED_SIZE of them, and the client reads every guardian's list.
+#
+# FM_MINT_CLIENT is a ready-to-run command line, deliberately left unquoted so
+# it splits into a program and its arguments. `pass` is the admin password
+# devimint sets everywhere.
+pin_lnv2_gateways() {
+  [[ "$FM_SDK_SHAPE" == v2 ]] || return 0
+  local fed_size="${FM_FED_SIZE:-4}"
+  local lnd_needle=":${FM_PORT_GW_LND:?FM_PORT_GW_LND is not set}/"
+  local peer listed url
+  for ((peer = 0; peer < fed_size; peer++)); do
+    # shellcheck disable=SC2086
+    listed="$($FM_MINT_CLIENT --our-id "$peer" --password pass module lnv2 gateways list)"
+    if ! grep -qF "$lnd_needle" <<<"$listed"; then
+      echo "Guardian $peer does not list the LND gateway among its lnv2 gateways: $listed" >&2
+      exit 1
+    fi
+    while IFS= read -r url; do
+      [[ "$url" == *"$lnd_needle"* ]] && continue
+      echo "guardian $peer: removing lnv2 gateway not on LND: $url"
+      # shellcheck disable=SC2086
+      $FM_MINT_CLIENT --our-id "$peer" --password pass module lnv2 gateways remove "$url" >/dev/null
+    done < <(grep -o '"http[^"]*"' <<<"$listed" | tr -d '"')
+  done
+}
+pin_lnv2_gateways
 
 echo "Installing APK on $DEVICE_ID..."
 adb -s "$DEVICE_ID" install -r "$APK_PATH"
@@ -328,24 +394,32 @@ adb -s "$DEVICE_ID" shell pm clear "$APP_ID" || true
 # fail a test. The one this exists for: iroh's DNS resolver reads the device's
 # DNS servers through ConnectivityManager, which needs the Android context
 # published and ACCESS_NETWORK_STATE granted. When either is missing it logs a
-# warning and falls back to Google's DNS servers, and the tests still pass
+# warning and falls back to public DNS servers, and the tests still pass
 # because the Lightning test can use the plain HTTP gateway.
 #
-# So the property below turns on hickory's trace line that lists the servers
+# So the property below turns on the resolver's trace line listing the servers
 # it read ("Got DNS servers: …"), the SDK's tag is recorded to a file for the
 # whole run (a ring-buffer dump at the end could have rotated early lines
 # out), and check_dns_config fails the run if the fallback warning appears.
 # When the Lightning test runs it also requires the trace line: that test
-# dials devimint's iroh gateway, which is what builds a DNS resolver, so a
-# run without the line has not exercised the path at all and a missing
-# warning would prove nothing.
+# dials devimint's iroh gateway, which is what builds the SDK's two iroh
+# endpoints, and the resolver under the newer one reads the servers the first
+# time it looks a name up, so a run without the line has not exercised the
+# path at all and a missing warning would prove nothing.
+# The check covers that read and nothing else. With the servers read, the
+# resolver still sends a lookup to the same public servers (Cloudflare, Google
+# and Quad9) when every one of the device's own fails it with a server error,
+# which it reports in a debug line this filter leaves out. The resolver under
+# the older endpoint, the one the gateway dial itself goes through, cannot
+# read the device's servers and always asks Google's, logging nothing. Nothing
+# here looks for either.
 # The property is read once per app process when logging starts, so it is set
 # before the first launch. The rest of the filter is the SDK's default, and the
 # property is cleared again on exit (empty means "use the default"), since on
 # a developer's own phone it would otherwise outlive the run until a reboot.
 SDK_LOGCAT="$LOG_DIR/fedimint-sdk-logcat.log"
 adb -s "$DEVICE_ID" shell setprop debug.fedimint_sdk.log \
-  "'warn,fm=info,fedimint=info,hickory_resolver::system_conf=trace'"
+  "'warn,fm=info,fedimint=info,n0_dns_resolver::system_config=trace'"
 adb -s "$DEVICE_ID" logcat -c
 adb -s "$DEVICE_ID" logcat -v time -s fedimint-sdk >"$SDK_LOGCAT" 2>&1 &
 LOGCAT_PID=$!
@@ -359,9 +433,9 @@ trap cleanup EXIT
 
 check_dns_config() {
   kill "$LOGCAT_PID" 2>/dev/null || true
-  if grep -q "Failed to read the system's DNS config" "$SDK_LOGCAT"; then
-    echo "The SDK could not read the device's DNS configuration and fell back to Google DNS:" >&2
-    grep -B2 -A2 "Failed to read the system's DNS config" "$SDK_LOGCAT" >&2
+  if grep -q "failed to read system DNS configuration" "$SDK_LOGCAT"; then
+    echo "The SDK could not read the device's DNS configuration and fell back to public DNS:" >&2
+    grep -B2 -A2 "failed to read system DNS configuration" "$SDK_LOGCAT" >&2
     return 1
   fi
 
@@ -370,6 +444,15 @@ check_dns_config() {
   if [[ -n "$found" ]]; then
     echo "The SDK read the device's DNS configuration:"
     echo "$found"
+    return 0
+  fi
+  # Only v1 has to have built a resolver: on v2 the lnv2 gateway list is pinned
+  # to devimint's LND gateway (see pin_lnv2_gateways), which is plain HTTP, so
+  # no lightning test dials the iroh gateway that builds one. The fallback
+  # warning above still fails a v2 run.
+  if [[ "$FM_SDK_SHAPE" != v1 ]]; then
+    echo "No DNS resolver read the device's DNS configuration during this ${FM_SDK_SHAPE} run" \
+      "(expected: lnv2 is pinned to the HTTP LND gateway)."
     return 0
   fi
   # Word-split on purpose: TESTS_TO_RUN is the runner's argument list.
@@ -401,6 +484,7 @@ PLATFORM=android \
   APP_PACKAGE="$APP_ID" \
   APP_ACTIVITY="$APP_ACTIVITY" \
   FAUCET="${FAUCET:-http://localhost:${FM_PORT_FAUCET:-15243}}" \
+  FM_SDK_SHAPE="$FM_SDK_SHAPE" \
   pnpm exec ts-node --project tsconfig.json src/runner.ts $TESTS_TO_RUN &&
   tests_status=0 || tests_status=$?
 

@@ -34,14 +34,21 @@ build-android-apk:
 # the same scripts/setup_test_shell.sh. There is deliberately no federation-free
 # variant: one way to run this suite, so what CI does and what you can
 # reproduce are the same thing. Builds the APK first (see build-android-apk);
-# the script itself only installs one.
-test-android-e2e: build-android-apk
-    nix develop --accept-flake-config .#android-tests -c scripts/setup_test_shell.sh bash scripts/e2e-android/run-android-e2e.sh
+# the script itself only installs one. `shape` picks the federation's module
+# generation: v1 (mint, wallet, ln) or v2 (mintv2, walletv2, lnv2).
+test-android-e2e shape="v1": build-android-apk
+    FM_SDK_SHAPE={{shape}} nix develop --accept-flake-config .#android-tests -c scripts/setup_test_shell.sh bash scripts/e2e-android/run-android-e2e.sh
 
 # Test the release gates: the version and changelog scripts the release, tag
 # and bump workflows rely on. Needs only bash and git, no build.
 test-android-sdk-scripts:
     ./scripts/test-android-sdk-scripts.sh
+
+# Test the React Native release scripts: what a valid release tag is, how the packages are
+# packed and checked, and when they are published. Needs only bash, git and node, no build.
+test-react-native-sdk-scripts:
+    ./scripts/test-react-native-sdk-scripts.sh
+    ./scripts/test-assemble-rn-ios-xcframework.sh
 
 # Assemble the release AAR. Publishing to Maven Central is .github/workflows/android-sdk-release.yaml.
 build-android-aar: build-android-sdk
@@ -139,6 +146,11 @@ build-rn-ios:
     NIX_CONFIG=$'max-jobs = 1\ncores = 1' \
       nix develop --accept-flake-config .#ios -c scripts/build-sdk-rn-ios.sh
     nix develop --accept-flake-config .#ios -c pnpm --dir js run build:reactnative
+
+# The xcframework @fedimint/react-native-bindings is published with, assembled from the Apple
+# libraries `just build-ios-lib-nix` leaves behind. macOS with Xcode only; see the script.
+assemble-rn-ios-xcframework:
+    nix shell --accept-flake-config .#llvm-bitcode-strip -c scripts/assemble-rn-ios-xcframework.sh
 
 test-coverage:
     nix develop --accept-flake-config .#wasm-tests -c pnpm --dir js run test:coverage
