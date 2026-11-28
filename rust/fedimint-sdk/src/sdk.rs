@@ -4096,7 +4096,8 @@ mod tests {
                 module_instance_id: 99,
                 state: vec![1, 2, 3],
             };
-            let mut dbtx = unconfigured_inner.db().begin_transaction().await;
+            let unconf_db = unconfigured_inner.db();
+            let mut dbtx = unconf_db.begin_transaction().await;
             dbtx.insert_entry(&state_99, &meta).await;
             dbtx.insert_entry(
                 &fedimint_client::db::OperationLogKey {
@@ -4134,7 +4135,8 @@ mod tests {
                 module_instance_id: TRANSACTION_SUBMISSION_MODULE_INSTANCE,
                 state: vec![4, 5, 6],
             };
-            let mut dbtx = tx_sub_inner.db().begin_transaction().await;
+            let tx_sub_db = tx_sub_inner.db();
+            let mut dbtx = tx_sub_db.begin_transaction().await;
             dbtx.insert_entry(&state_tx, &meta).await;
             dbtx.insert_entry(
                 &fedimint_client::db::OperationLogKey {
@@ -4191,7 +4193,7 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn forget_closed_corrupted_recovery_still_skips_guards() {
-            use fedimint_core::db::{DatabaseKey, IDatabaseTransactionOpsCore};
+            use fedimint_core::db::IDatabaseTransactionOpsCore;
 
             let sdk = Sdk::builder()
                 .storage(Storage::in_memory())
