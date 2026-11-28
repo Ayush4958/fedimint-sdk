@@ -857,6 +857,7 @@ impl FederationInner {
                 let keys = crate::db::read_keys_by_prefix(
                     &mut module_dbtx,
                     &fedimint_mint_client::client_db::NoteKeyPrefix,
+                    &decoders,
                 )
                 .await?;
                 sum_msats(&mut total_msats, keys.into_iter().map(|k| k.amount.msats))?;
@@ -864,6 +865,7 @@ impl FederationInner {
                 let keys = crate::db::read_keys_by_prefix(
                     &mut module_dbtx,
                     &fedimint_mintv2_client::client_db::SpendableNotePrefix,
+                    &decoders,
                 )
                 .await?;
                 sum_msats(
@@ -896,9 +898,11 @@ impl FederationInner {
             return Ok(false);
         };
 
+        let decoders = crate::modules::decoders(module_inits, &config);
         let active_states = crate::db::read_keys_by_prefix(
             &mut dbtx,
             &fedimint_client::sm::executor::ActiveStateKeyPrefixBytes,
+            &decoders,
         )
         .await?;
         let candidate_ops: HashSet<fedimint_core::core::OperationId> = active_states

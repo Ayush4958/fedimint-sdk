@@ -389,29 +389,30 @@ where
 pub(crate) async fn read_keys_by_prefix<P, Cap>(
     dbtx: &mut DatabaseTransaction<'_, Cap>,
     prefix: &P,
+    decoders: &ModuleDecoderRegistry,
 ) -> Result<Vec<<P::Record as DatabaseRecord>::Key>>
 where
     P: DatabaseLookup,
     Cap: Send,
 {
     let prefix_bytes = DatabaseKeyPrefix::to_bytes(prefix);
-    let raw: Vec<(Vec<u8>, Vec<u8>)> = dbtx
+    let mut stream = dbtx
         .raw_find_by_prefix(&prefix_bytes)
         .await
-        .map_err(backend_error)?
-        .collect()
-        .await;
-    let decoders = ModuleDecoderRegistry::default();
-    raw.into_iter()
-        .map(|(key_bytes, _)| {
-            <P::Record as DatabaseRecord>::Key::from_bytes(&key_bytes, &decoders).map_err(|err| {
+        .map_err(backend_error)?;
+    let mut keys = Vec::new();
+    while let Some((key_bytes, _)) = stream.next().await {
+        let key = <P::Record as DatabaseRecord>::Key::from_bytes(&key_bytes, decoders).map_err(
+            |err| {
                 Error::new(
                     ErrorCode::Storage,
                     format!("unreadable key: {}", err.fmt_compact()),
                 )
-            })
-        })
-        .collect()
+            },
+        )?;
+        keys.push(key);
+    }
+    Ok(keys)
 }
 
 /// Writes one record.

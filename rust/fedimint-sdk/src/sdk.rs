@@ -1029,8 +1029,8 @@ impl Sdk {
     /// [`BalanceNotEmpty`](crate::ErrorCode::BalanceNotEmpty) and
     /// [`PendingOperations`](crate::ErrorCode::PendingOperations) for a
     /// phase-2 refusal, which deletes nothing;
-    /// [`Storage`](crate::ErrorCode::Storage) if the backend fails,
-    /// retryable either way; and
+    /// [`Storage`](crate::ErrorCode::Storage) if the backend fails, or if local
+    /// client state cannot be decoded, refusing deletion to protect funds; and
     /// [`FederationClosed`](crate::ErrorCode::FederationClosed) after
     /// shutdown. Never [`Recovering`](crate::ErrorCode::Recovering).
     pub async fn forget_federation(&self, id: &FederationId) -> Result<()> {
@@ -1055,12 +1055,13 @@ impl Sdk {
         }
         // A federation closed or quarantined before its recovery reached `Done` still has
         // provisional, unspendable state, and erasing it remains the sole documented exit.
+        // An unreadable recovery record is likewise treated as unfinished so a quarantined
+        // recovery can always be erased.
         let recovering = status == FederationStatus::Recovering
             || (!already_committed
-                && matches!(
-                    crate::recovery::engine::attempt_on_file(&self.inner, &federation).await?,
-                    Some((_, on_file))
-                        if !matches!(on_file, crate::recovery::engine::AttemptOnFile::Done)
+                && !matches!(
+                    crate::recovery::engine::attempt_on_file(&self.inner, &federation).await,
+                    Ok(None) | Ok(Some((_, crate::recovery::engine::AttemptOnFile::Done)))
                 ));
 
         // Phase 2: refuse unless it is safe, deleting nothing. A recovery-locked federation
@@ -4073,6 +4074,87 @@ mod tests {
                 assert_eq!(err.code, crate::ErrorCode::PendingOperations);
             }
             assert_eq!(sdk.stored_federations().len(), 1);
+
+            // An active state under a module instance ID missing from client config is ignored,
+            // matching `Client::get_active_operations` filtering out uninitialized modules.
+            let unconfigured_id = fedimint_core::config::FederationId::dummy();
+            let unconfigured_public = crate::FederationId::from_upstream(unconfigured_id);
+            plant_closed_federation(&sdk, unconfigured_id).await;
+            plant_client_config(
+                &sdk,
+                unconfigured_id,
+                BTreeMap::from([(0, mint_v1_module_config())]),
+            )
+            .await;
+            let unconfigured_inner = sdk
+                .inner()
+                .federation_inner(&unconfigured_id)
+                .expect("planted");
+            let op_99 = fedimint_core::core::OperationId([99u8; 32]);
+            let state_99 = fedimint_client::sm::executor::ActiveStateKeyBytes {
+                operation_id: op_99,
+                module_instance_id: 99,
+                state: vec![1, 2, 3],
+            };
+            let mut dbtx = unconfigured_inner.db().begin_transaction().await;
+            dbtx.insert_entry(&state_99, &meta).await;
+            dbtx.insert_entry(
+                &fedimint_client::db::OperationLogKey {
+                    operation_id: op_99,
+                },
+                &op_log_entry,
+            )
+            .await;
+            dbtx.commit_tx().await;
+            assert!(
+                !unconfigured_inner
+                    .has_active_operations_in_db(&sdk.inner().module_inits)
+                    .await
+                    .expect("db read succeeds")
+            );
+            sdk.forget_federation(&unconfigured_public)
+                .await
+                .expect("unconfigured module state does not block erase");
+
+            // An active state under `TRANSACTION_SUBMISSION_MODULE_INSTANCE` does block erase.
+            use fedimint_client_module::transaction::TRANSACTION_SUBMISSION_MODULE_INSTANCE;
+            let tx_sub_id = fedimint_core::config::FederationId::dummy();
+            let tx_sub_public = crate::FederationId::from_upstream(tx_sub_id);
+            plant_closed_federation(&sdk, tx_sub_id).await;
+            plant_client_config(
+                &sdk,
+                tx_sub_id,
+                BTreeMap::from([(0, mint_v1_module_config())]),
+            )
+            .await;
+            let tx_sub_inner = sdk.inner().federation_inner(&tx_sub_id).expect("planted");
+            let op_tx = fedimint_core::core::OperationId([88u8; 32]);
+            let state_tx = fedimint_client::sm::executor::ActiveStateKeyBytes {
+                operation_id: op_tx,
+                module_instance_id: TRANSACTION_SUBMISSION_MODULE_INSTANCE,
+                state: vec![4, 5, 6],
+            };
+            let mut dbtx = tx_sub_inner.db().begin_transaction().await;
+            dbtx.insert_entry(&state_tx, &meta).await;
+            dbtx.insert_entry(
+                &fedimint_client::db::OperationLogKey {
+                    operation_id: op_tx,
+                },
+                &op_log_entry,
+            )
+            .await;
+            dbtx.commit_tx().await;
+            assert!(
+                tx_sub_inner
+                    .has_active_operations_in_db(&sdk.inner().module_inits)
+                    .await
+                    .expect("db read succeeds")
+            );
+            let err = sdk
+                .forget_federation(&tx_sub_public)
+                .await
+                .expect_err("tx submission active state must refuse erase");
+            assert_eq!(err.code, crate::ErrorCode::PendingOperations);
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -4103,6 +4185,39 @@ mod tests {
             sdk.forget_federation(&public)
                 .await
                 .expect("incomplete recovery skips guards even when closed");
+            assert_eq!(sdk.federation_status(&public), None);
+            assert!(sdk.stored_federations().is_empty());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn forget_closed_corrupted_recovery_still_skips_guards() {
+            use fedimint_core::db::{DatabaseKey, IDatabaseTransactionOpsCore};
+
+            let sdk = Sdk::builder()
+                .storage(Storage::in_memory())
+                .build()
+                .await
+                .expect("an instance opens");
+            let id = fedimint_core::config::FederationId::dummy();
+            let public = crate::FederationId::from_upstream(id);
+            plant_closed_federation(&sdk, id).await;
+            plant_client_config(&sdk, id, BTreeMap::from([(0, mint_v1_module_config())])).await;
+            plant_v1_note(&sdk, id, 5_000).await;
+
+            // Plant an unreadable/corrupted recovery record raw entry in the root database.
+            let recovery_key = crate::db::RecoveryKey(id).to_bytes();
+            let sdk_db = sdk.inner().db.with_prefix(crate::db::sdk_prefix().to_vec());
+            let mut dbtx = sdk_db.begin_transaction().await;
+            dbtx.raw_insert_bytes(&recovery_key, &[0xff, 0xff])
+                .await
+                .expect("corrupt recovery inserted");
+            crate::db::commit(dbtx).await.expect("committed");
+
+            // Even with unreadable recovery bytes and spendable notes present, forget_federation
+            // must treat it as unfinished, skip guards, and successfully erase the stuck federation.
+            sdk.forget_federation(&public)
+                .await
+                .expect("corrupted recovery skips guards and erases");
             assert_eq!(sdk.federation_status(&public), None);
             assert!(sdk.stored_federations().is_empty());
         }
