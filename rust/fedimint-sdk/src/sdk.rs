@@ -1029,8 +1029,8 @@ impl Sdk {
     /// [`BalanceNotEmpty`](crate::ErrorCode::BalanceNotEmpty) and
     /// [`PendingOperations`](crate::ErrorCode::PendingOperations) for a
     /// phase-2 refusal, which deletes nothing;
-    /// [`Storage`](crate::ErrorCode::Storage) if the backend fails, or if local
-    /// client state cannot be decoded, refusing deletion to protect funds; and
+    /// [`Storage`](crate::ErrorCode::Storage) if the backend fails,
+    /// retryable either way; and
     /// [`FederationClosed`](crate::ErrorCode::FederationClosed) after
     /// shutdown. Never [`Recovering`](crate::ErrorCode::Recovering).
     pub async fn forget_federation(&self, id: &FederationId) -> Result<()> {
@@ -4074,30 +4074,40 @@ mod tests {
                 assert_eq!(err.code, crate::ErrorCode::PendingOperations);
             }
             assert_eq!(sdk.stored_federations().len(), 1);
+        }
 
-            // An active state under a module instance ID missing from client config is ignored,
-            // matching `Client::get_active_operations` filtering out uninitialized modules.
-            let unconfigured_id = fedimint_core::config::FederationId::dummy();
-            let unconfigured_public = crate::FederationId::from_upstream(unconfigured_id);
-            plant_closed_federation(&sdk, unconfigured_id).await;
-            plant_client_config(
-                &sdk,
-                unconfigured_id,
-                BTreeMap::from([(0, mint_v1_module_config())]),
-            )
-            .await;
-            let unconfigured_inner = sdk
-                .inner()
-                .federation_inner(&unconfigured_id)
-                .expect("planted");
+        #[tokio::test(flavor = "multi_thread")]
+        async fn forget_closed_federation_ignores_active_state_for_unconfigured_module() {
+            use fedimint_core::db::IDatabaseTransactionOpsCoreTyped;
+
+            let sdk = Sdk::builder()
+                .storage(Storage::in_memory())
+                .build()
+                .await
+                .expect("an instance opens");
+            let id = fedimint_core::config::FederationId::dummy();
+            let public = crate::FederationId::from_upstream(id);
+            plant_closed_federation(&sdk, id).await;
+            plant_client_config(&sdk, id, BTreeMap::from([(0, mint_v1_module_config())])).await;
+
+            let fed_inner = sdk.inner().federation_inner(&id).expect("planted");
             let op_99 = fedimint_core::core::OperationId([99u8; 32]);
             let state_99 = fedimint_client::sm::executor::ActiveStateKeyBytes {
                 operation_id: op_99,
                 module_instance_id: 99,
                 state: vec![1, 2, 3],
             };
-            let unconf_db = unconfigured_inner.db();
-            let mut dbtx = unconf_db.begin_transaction().await;
+            let meta = fedimint_client_module::sm::ActiveStateMeta {
+                created_at: std::time::SystemTime::UNIX_EPOCH,
+            };
+            let op_log_entry = fedimint_client_module::oplog::OperationLogEntry::new(
+                "custom".to_owned(),
+                fedimint_client_module::oplog::JsonStringed(serde_json::json!({})),
+                None,
+            );
+
+            let db = fed_inner.db();
+            let mut dbtx = db.begin_transaction().await;
             dbtx.insert_entry(&state_99, &meta).await;
             dbtx.insert_entry(
                 &fedimint_client::db::OperationLogKey {
@@ -4107,36 +4117,55 @@ mod tests {
             )
             .await;
             dbtx.commit_tx().await;
+
+            // An active state under a module instance ID missing from client config is ignored,
+            // matching `Client::get_active_operations` filtering out uninitialized modules.
             assert!(
-                !unconfigured_inner
+                !fed_inner
                     .has_active_operations_in_db(&sdk.inner().module_inits)
                     .await
                     .expect("db read succeeds")
             );
-            sdk.forget_federation(&unconfigured_public)
+            sdk.forget_federation(&public)
                 .await
                 .expect("unconfigured module state does not block erase");
+            assert_eq!(sdk.federation_status(&public), None);
+            assert!(sdk.stored_federations().is_empty());
+        }
 
-            // An active state under `TRANSACTION_SUBMISSION_MODULE_INSTANCE` does block erase.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn forget_closed_federation_refuses_with_transaction_submission_active_state() {
             use fedimint_client_module::transaction::TRANSACTION_SUBMISSION_MODULE_INSTANCE;
-            let tx_sub_id = fedimint_core::config::FederationId::dummy();
-            let tx_sub_public = crate::FederationId::from_upstream(tx_sub_id);
-            plant_closed_federation(&sdk, tx_sub_id).await;
-            plant_client_config(
-                &sdk,
-                tx_sub_id,
-                BTreeMap::from([(0, mint_v1_module_config())]),
-            )
-            .await;
-            let tx_sub_inner = sdk.inner().federation_inner(&tx_sub_id).expect("planted");
+            use fedimint_core::db::IDatabaseTransactionOpsCoreTyped;
+
+            let sdk = Sdk::builder()
+                .storage(Storage::in_memory())
+                .build()
+                .await
+                .expect("an instance opens");
+            let id = fedimint_core::config::FederationId::dummy();
+            let public = crate::FederationId::from_upstream(id);
+            plant_closed_federation(&sdk, id).await;
+            plant_client_config(&sdk, id, BTreeMap::from([(0, mint_v1_module_config())])).await;
+
+            let fed_inner = sdk.inner().federation_inner(&id).expect("planted");
             let op_tx = fedimint_core::core::OperationId([88u8; 32]);
             let state_tx = fedimint_client::sm::executor::ActiveStateKeyBytes {
                 operation_id: op_tx,
                 module_instance_id: TRANSACTION_SUBMISSION_MODULE_INSTANCE,
                 state: vec![4, 5, 6],
             };
-            let tx_sub_db = tx_sub_inner.db();
-            let mut dbtx = tx_sub_db.begin_transaction().await;
+            let meta = fedimint_client_module::sm::ActiveStateMeta {
+                created_at: std::time::SystemTime::UNIX_EPOCH,
+            };
+            let op_log_entry = fedimint_client_module::oplog::OperationLogEntry::new(
+                "tx".to_owned(),
+                fedimint_client_module::oplog::JsonStringed(serde_json::json!({})),
+                None,
+            );
+
+            let db = fed_inner.db();
+            let mut dbtx = db.begin_transaction().await;
             dbtx.insert_entry(&state_tx, &meta).await;
             dbtx.insert_entry(
                 &fedimint_client::db::OperationLogKey {
@@ -4146,17 +4175,20 @@ mod tests {
             )
             .await;
             dbtx.commit_tx().await;
+
+            // An active state under `TRANSACTION_SUBMISSION_MODULE_INSTANCE` does block erase.
             assert!(
-                tx_sub_inner
+                fed_inner
                     .has_active_operations_in_db(&sdk.inner().module_inits)
                     .await
                     .expect("db read succeeds")
             );
             let err = sdk
-                .forget_federation(&tx_sub_public)
+                .forget_federation(&public)
                 .await
                 .expect_err("tx submission active state must refuse erase");
             assert_eq!(err.code, crate::ErrorCode::PendingOperations);
+            assert_eq!(sdk.stored_federations().len(), 1);
         }
 
         #[tokio::test(flavor = "multi_thread")]
