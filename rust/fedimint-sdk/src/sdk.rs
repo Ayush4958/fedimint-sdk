@@ -4193,7 +4193,7 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn forget_closed_corrupted_recovery_still_skips_guards() {
-            use fedimint_core::db::IDatabaseTransactionOpsCore;
+            use fedimint_core::db::{DatabaseKeyPrefix, IDatabaseTransactionOpsCore};
 
             let sdk = Sdk::builder()
                 .storage(Storage::in_memory())
@@ -4207,7 +4207,7 @@ mod tests {
             plant_v1_note(&sdk, id, 5_000).await;
 
             // Plant an unreadable/corrupted recovery record raw entry in the root database.
-            let recovery_key = crate::db::RecoveryKey(id).to_bytes();
+            let recovery_key = DatabaseKeyPrefix::to_bytes(&crate::db::RecoveryKey(id));
             let sdk_db = sdk.inner().db.with_prefix(crate::db::sdk_prefix().to_vec());
             let mut dbtx = sdk_db.begin_transaction().await;
             dbtx.raw_insert_bytes(&recovery_key, &[0xff, 0xff])
